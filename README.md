@@ -172,11 +172,11 @@ This library uses Funda's undocumented mobile app API, which provides clean JSON
 
 The API was reverse engineered by intercepting and analyzing HTTPS traffic from the official Funda Android app:
 
-1. **Traffic Interception**: Configured an Android device to route traffic through an intercepting proxy with a trusted CA certificate installed
-2. **App Analysis**: Used the Funda app normally - browsing listings, searching, opening shared URLs
-3. **Endpoint Mapping**: Identified the `*.funda.io` API infrastructure separate from the `www.funda.nl` website
-4. **Parameter Discovery**: Analyzed request/response patterns to understand the query format and available filters
-5. **ID Resolution**: Discovered how the app resolves URL-based IDs (`tinyId`) to internal IDs (`globalId`) by opening shared Funda links in the app
+1. Configured an Android device to route traffic through an intercepting proxy
+2. Used the Funda app normally - browsing listings, searching, opening shared URLs
+3. Identified the `*.funda.io` API infrastructure separate from the `www.funda.nl` website
+4. Analyzed request/response patterns to understand the query format and available filters
+5. Discovered how the app resolves URL-based IDs (`tinyId`) to internal IDs (`globalId`)
 
 ### API Architecture
 
