@@ -125,7 +125,8 @@ class Funda:
         price_max: int | None = None,
         area_min: int | None = None,
         area_max: int | None = None,
-        results: int = 15,
+        object_type: list[str] | None = None,
+        page: int = 0,
     ) -> list[Listing]:
         """Search for listings.
 
@@ -136,10 +137,11 @@ class Funda:
             price_max: Maximum price
             area_min: Minimum living area in m²
             area_max: Maximum living area in m²
-            results: Maximum number of results
+            object_type: Property types (e.g. ["house", "apartment"])
+            page: Page number (0-indexed, 15 results per page)
 
         Returns:
-            List of Listing objects
+            List of Listing objects (max 15 per page)
 
         Example:
             >>> f.search_listing('amsterdam', price_max=500000)
@@ -157,28 +159,33 @@ class Funda:
             "availability": ["available", "negotiations"],
             "type": ["single"],
             "zoning": ["residential"],
+            "object_type": object_type or ["house", "apartment"],
             "publication_date": {"no_preference": True},
             "offering_type": offering_type,
-            "page": {"from": 0, "size": results},
+            "page": {"from": page * 15},
             "sort": {"field": None, "order": None},
         }
 
         if locations:
-            params["locations"] = locations
+            params["selected_area"] = locations
 
+        # Price filter - format depends on offering type
         if price_min is not None or price_max is not None:
-            params["price"] = {}
+            price_key = "selling_price" if offering_type == "buy" else "rent_price"
+            price_filter: dict[str, int] = {}
             if price_min:
-                params["price"]["min"] = price_min
+                price_filter["from"] = price_min
             if price_max:
-                params["price"]["max"] = price_max
+                price_filter["to"] = price_max
+            params["price"] = {price_key: price_filter}
 
         if area_min is not None or area_max is not None:
-            params["floor_area"] = {}
+            floor_filter: dict[str, int] = {}
             if area_min:
-                params["floor_area"]["min"] = area_min
+                floor_filter["from"] = area_min
             if area_max:
-                params["floor_area"]["max"] = area_max
+                floor_filter["to"] = area_max
+            params["floor_area"] = floor_filter
 
         # Build NDJSON query
         index_line = json.dumps({"index": "listings-wonen-searcher-alias-prod"})
@@ -305,7 +312,7 @@ class Funda:
             if isinstance(price_data, dict):
                 price = price_data.get("selling_price", [None])[0]
                 if not price:
-                    price = price_data.get("rental_price", [None])[0] if price_data.get("rental_price") else None
+                    price = price_data.get("rent_price", [None])[0] if price_data.get("rent_price") else None
             else:
                 price = price_data
 
