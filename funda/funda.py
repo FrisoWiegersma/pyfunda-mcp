@@ -197,11 +197,14 @@ class Funda:
         # Location - either radius search or selected_area
         if locations and radius_km and len(locations) == 1:
             # Radius search from postcode or city
+            # Valid radius values in the geo index
+            valid_radii = [1, 2, 5, 10, 15, 30, 50]
+            actual_radius = min(valid_radii, key=lambda x: abs(x - radius_km))
             loc_id = locations[0].lower().replace(" ", "-") + "-0"
             params["radius_search"] = {
                 "index": "geo-wonen-alias-prod",
                 "id": loc_id,
-                "path": f"area_with_radius.{radius_km}",
+                "path": f"area_with_radius.{actual_radius}",
             }
         elif locations:
             params["selected_area"] = locations

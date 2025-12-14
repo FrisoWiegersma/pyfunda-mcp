@@ -27,7 +27,6 @@ class Listing:
         'locality': 'city',
         'area': 'living_area',
         'size': 'living_area',
-        
         'coords': 'coordinates',
         'lat': 'latitude',
         'lng': 'longitude',
