@@ -65,7 +65,8 @@ results = f.search_listing(
     price_max=500000,               # Maximum price
     area_min=50,                    # Minimum living area (m²)
     area_max=150,                   # Maximum living area (m²)
-    results=25,                     # Max results to return
+    object_type=['house'],          # Property types (default: house, apartment)
+    page=0,                         # Page number (15 results per page)
 )
 ```
 
@@ -158,11 +159,85 @@ results = f.search_listing(
     location=['amsterdam', 'rotterdam', 'den-haag'],
     offering_type='rent',
     price_max=2000,
-    results=50
 )
 
 print(f"Found {len(results)} rentals")
 ```
+
+## How It Works
+
+This library uses Funda's undocumented mobile app API, which provides clean JSON responses unlike the website that embeds data in Nuxt.js/JavaScript bundles.
+
+### Discovery Process
+
+The API was reverse engineered by intercepting and analyzing HTTPS traffic from the official Funda Android app:
+
+1. **Traffic Interception**: Configured an Android device to route traffic through an intercepting proxy with a trusted CA certificate installed
+2. **App Analysis**: Used the Funda app normally - browsing listings, searching, opening shared URLs
+3. **Endpoint Mapping**: Identified the `*.funda.io` API infrastructure separate from the `www.funda.nl` website
+4. **Parameter Discovery**: Analyzed request/response patterns to understand the query format and available filters
+5. **ID Resolution**: Discovered how the app resolves URL-based IDs (`tinyId`) to internal IDs (`globalId`) by opening shared Funda links in the app
+
+### API Architecture
+
+The mobile app communicates with a separate API at `*.funda.io`:
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `listing-detail-page.funda.io/api/v4/listing/object/nl/{globalId}` | GET | Fetch listing by internal ID |
+| `listing-detail-page.funda.io/api/v4/listing/object/nl/tinyId/{tinyId}` | GET | Fetch listing by URL ID |
+| `listing-search-wonen.funda.io/_msearch/template` | POST | Search listings |
+
+### ID System
+
+Funda uses two ID systems:
+- **globalId**: Internal numeric ID (7 digits), used in the database
+- **tinyId**: Public-facing ID (8-9 digits), appears in URLs like `funda.nl/detail/koop/amsterdam/.../{tinyId}/`
+
+The `tinyId` endpoint was key - it allows fetching any listing directly from a Funda URL without needing to know the internal ID.
+
+### Search API
+
+Search uses Elasticsearch's [Multi Search Template API](https://www.elastic.co/guide/en/elasticsearch/reference/current/multi-search-template.html) with NDJSON format:
+
+```
+{"index":"listings-wonen-searcher-alias-prod"}
+{"id":"search_result_20250805","params":{...}}
+```
+
+**Search parameters:**
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `selected_area` | Location filter | `["amsterdam"]` |
+| `offering_type` | Buy or rent | `"buy"` or `"rent"` |
+| `price.selling_price` | Price range (buy) | `{"from": 200000, "to": 500000}` |
+| `price.rent_price` | Price range (rent) | `{"from": 500, "to": 2000}` |
+| `object_type` | Property types | `["house", "apartment"]` |
+| `floor_area` | Living area m² | `{"from": 50, "to": 150}` |
+| `page.from` | Pagination offset | `0`, `15`, `30`... |
+
+Results are paginated with 15 listings per page.
+
+### Required Headers
+
+```
+User-Agent: Dart/3.9 (dart:io)
+X-Funda-App-Platform: android
+Content-Type: application/json
+```
+
+### Response Data
+
+Listing responses include:
+- **Identifiers** - globalId, tinyId
+- **AddressDetails** - title, city, postcode, province, neighbourhood
+- **Price** - numeric and formatted prices (selling or rental)
+- **FastView** - bedrooms, living area, energy label
+- **Media** - photo IDs, floorplans, videos
+- **KenmerkSections** - detailed property characteristics
+- **Coordinates** - latitude/longitude
+- **ObjectInsights** - view and save counts
 
 ## License
 
