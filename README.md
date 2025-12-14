@@ -29,6 +29,92 @@ for r in results:
     print(r['title'], r['price'])
 ```
 
+## How It Works
+
+This library uses Funda's undocumented mobile app API, which provides clean JSON responses unlike the website that embeds data in Nuxt.js/JavaScript bundles.
+
+### Discovery Process
+
+The API was reverse engineered by intercepting and analyzing HTTPS traffic from the official Funda Android app:
+
+1. Configured an Android device to route traffic through an intercepting proxy
+2. Used the Funda app normally - browsing listings, searching, opening shared URLs
+3. Identified the `*.funda.io` API infrastructure separate from the `www.funda.nl` website
+4. Analyzed request/response patterns to understand the query format and available filters
+5. Discovered how the app resolves URL-based IDs (`tinyId`) to internal IDs (`globalId`)
+
+### API Architecture
+
+The mobile app communicates with a separate API at `*.funda.io`:
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `listing-detail-page.funda.io/api/v4/listing/object/nl/{globalId}` | GET | Fetch listing by internal ID |
+| `listing-detail-page.funda.io/api/v4/listing/object/nl/tinyId/{tinyId}` | GET | Fetch listing by URL ID |
+| `listing-search-wonen.funda.io/_msearch/template` | POST | Search listings |
+
+### ID System
+
+Funda uses two ID systems:
+- **globalId**: Internal numeric ID (7 digits), used in the database
+- **tinyId**: Public-facing ID (8-9 digits), appears in URLs like `funda.nl/detail/koop/amsterdam/.../{tinyId}/`
+
+The `tinyId` endpoint was key - it allows fetching any listing directly from a Funda URL without needing to know the internal ID.
+
+### Search API
+
+Search uses Elasticsearch's [Multi Search Template API](https://www.elastic.co/guide/en/elasticsearch/reference/current/multi-search-template.html) with NDJSON format:
+
+```
+{"index":"listings-wonen-searcher-alias-prod"}
+{"id":"search_result_20250805","params":{...}}
+```
+
+**Search parameters:**
+
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `selected_area` | Location filter | `["amsterdam"]` |
+| `radius_search` | Radius from location | `{"index": "geo-wonen-alias-prod", "id": "1012AB-0", "path": "area_with_radius.10"}` |
+| `offering_type` | Buy or rent | `"buy"` or `"rent"` |
+| `price.selling_price` | Price range (buy) | `{"from": 200000, "to": 500000}` |
+| `price.rent_price` | Price range (rent) | `{"from": 500, "to": 2000}` |
+| `object_type` | Property types | `["house", "apartment"]` |
+| `floor_area` | Living area m² | `{"from": 50, "to": 150}` |
+| `plot_area` | Plot area m² | `{"from": 100, "to": 500}` |
+| `energy_label` | Energy labels | `["A", "A+", "A++"]` |
+| `sort` | Sort order | `{"field": "publish_date_utc", "order": "desc"}` |
+| `page.from` | Pagination offset | `0`, `15`, `30`... |
+
+Results are paginated with 15 listings per page.
+
+**Valid radius values:** 1, 2, 5, 10, 15, 30, 50 km (other values are not indexed).
+
+### Required Headers
+
+```
+User-Agent: Dart/3.9 (dart:io)
+X-Funda-App-Platform: android
+Content-Type: application/json
+```
+
+### Response Data
+
+Listing responses include:
+- **Identifiers** - globalId, tinyId
+- **AddressDetails** - title, city, postcode, province, neighbourhood, house number
+- **Price** - numeric and formatted prices (selling or rental), auction flag
+- **FastView** - bedrooms, living area, plot area, energy label
+- **Media** - photos, floorplans, videos, 360° photos, brochure URL (all with CDN base URLs)
+- **KenmerkSections** - detailed property characteristics (70+ fields)
+- **Coordinates** - latitude/longitude
+- **ObjectInsights** - view and save counts
+- **Advertising.TargetingOptions** - boolean features (garden, balcony, solar panels, heat pump, parking, etc.), construction year, room counts
+- **Share** - shareable URL
+- **GoogleMapsObjectUrl** - direct Google Maps link
+- **PublicationDate** - when the listing was published
+- **Tracking.Values.brokers** - broker ID and association
+
 ## API Reference
 
 ### Funda
@@ -332,92 +418,6 @@ results = f.search_listing(
 for r in results:
     print(f"{r['title']} - €{r['price']:,}")
 ```
-
-## How It Works
-
-This library uses Funda's undocumented mobile app API, which provides clean JSON responses unlike the website that embeds data in Nuxt.js/JavaScript bundles.
-
-### Discovery Process
-
-The API was reverse engineered by intercepting and analyzing HTTPS traffic from the official Funda Android app:
-
-1. Configured an Android device to route traffic through an intercepting proxy
-2. Used the Funda app normally - browsing listings, searching, opening shared URLs
-3. Identified the `*.funda.io` API infrastructure separate from the `www.funda.nl` website
-4. Analyzed request/response patterns to understand the query format and available filters
-5. Discovered how the app resolves URL-based IDs (`tinyId`) to internal IDs (`globalId`)
-
-### API Architecture
-
-The mobile app communicates with a separate API at `*.funda.io`:
-
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `listing-detail-page.funda.io/api/v4/listing/object/nl/{globalId}` | GET | Fetch listing by internal ID |
-| `listing-detail-page.funda.io/api/v4/listing/object/nl/tinyId/{tinyId}` | GET | Fetch listing by URL ID |
-| `listing-search-wonen.funda.io/_msearch/template` | POST | Search listings |
-
-### ID System
-
-Funda uses two ID systems:
-- **globalId**: Internal numeric ID (7 digits), used in the database
-- **tinyId**: Public-facing ID (8-9 digits), appears in URLs like `funda.nl/detail/koop/amsterdam/.../{tinyId}/`
-
-The `tinyId` endpoint was key - it allows fetching any listing directly from a Funda URL without needing to know the internal ID.
-
-### Search API
-
-Search uses Elasticsearch's [Multi Search Template API](https://www.elastic.co/guide/en/elasticsearch/reference/current/multi-search-template.html) with NDJSON format:
-
-```
-{"index":"listings-wonen-searcher-alias-prod"}
-{"id":"search_result_20250805","params":{...}}
-```
-
-**Search parameters:**
-
-| Parameter | Description | Example |
-|-----------|-------------|---------|
-| `selected_area` | Location filter | `["amsterdam"]` |
-| `radius_search` | Radius from location | `{"index": "geo-wonen-alias-prod", "id": "1012AB-0", "path": "area_with_radius.10"}` |
-| `offering_type` | Buy or rent | `"buy"` or `"rent"` |
-| `price.selling_price` | Price range (buy) | `{"from": 200000, "to": 500000}` |
-| `price.rent_price` | Price range (rent) | `{"from": 500, "to": 2000}` |
-| `object_type` | Property types | `["house", "apartment"]` |
-| `floor_area` | Living area m² | `{"from": 50, "to": 150}` |
-| `plot_area` | Plot area m² | `{"from": 100, "to": 500}` |
-| `energy_label` | Energy labels | `["A", "A+", "A++"]` |
-| `sort` | Sort order | `{"field": "publish_date_utc", "order": "desc"}` |
-| `page.from` | Pagination offset | `0`, `15`, `30`... |
-
-Results are paginated with 15 listings per page.
-
-**Valid radius values:** 1, 2, 5, 10, 15, 30, 50 km (other values are not indexed).
-
-### Required Headers
-
-```
-User-Agent: Dart/3.9 (dart:io)
-X-Funda-App-Platform: android
-Content-Type: application/json
-```
-
-### Response Data
-
-Listing responses include:
-- **Identifiers** - globalId, tinyId
-- **AddressDetails** - title, city, postcode, province, neighbourhood, house number
-- **Price** - numeric and formatted prices (selling or rental), auction flag
-- **FastView** - bedrooms, living area, plot area, energy label
-- **Media** - photos, floorplans, videos, 360° photos, brochure URL (all with CDN base URLs)
-- **KenmerkSections** - detailed property characteristics (70+ fields)
-- **Coordinates** - latitude/longitude
-- **ObjectInsights** - view and save counts
-- **Advertising.TargetingOptions** - boolean features (garden, balcony, solar panels, heat pump, parking, etc.), construction year, room counts
-- **Share** - shareable URL
-- **GoogleMapsObjectUrl** - direct Google Maps link
-- **PublicationDate** - when the listing was published
-- **Tracking.Values.brokers** - broker ID and association
 
 ## License
 
