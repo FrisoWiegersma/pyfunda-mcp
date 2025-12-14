@@ -65,12 +65,42 @@ results = f.search_listing(
     price_max=500000,               # Maximum price
     area_min=50,                    # Minimum living area (m²)
     area_max=150,                   # Maximum living area (m²)
+    plot_min=100,                   # Minimum plot area (m²)
+    plot_max=500,                   # Maximum plot area (m²)
     object_type=['house'],          # Property types (default: house, apartment)
+    energy_label=['A', 'A+'],       # Energy labels to filter
+    sort='newest',                  # Sort order (see below)
     page=0,                         # Page number (15 results per page)
 )
 ```
 
-Search multiple locations:
+**Radius search** - search within a radius from a postcode or city:
+
+```python
+results = f.search_listing(
+    location='1012AB',              # Postcode or city
+    radius_km=10,                   # Search radius in km
+    price_max=750000,
+)
+```
+
+> **Note:** Valid radius values are 1, 2, 5, 10, 15, 30, and 50 km. Other values are automatically mapped to the nearest valid radius.
+
+**Sort options:**
+
+| Sort Value | Description |
+|------------|-------------|
+| `newest` | Most recently published first |
+| `oldest` | Oldest listings first |
+| `price_asc` | Lowest price first |
+| `price_desc` | Highest price first |
+| `area_asc` | Smallest living area first |
+| `area_desc` | Largest living area first |
+| `plot_desc` | Largest plot area first |
+| `city` | Alphabetically by city |
+| `postcode` | Alphabetically by postcode |
+
+**Multiple locations:**
 
 ```python
 results = f.search_listing(['amsterdam', 'rotterdam', 'utrecht'])
@@ -80,18 +110,105 @@ results = f.search_listing(['amsterdam', 'rotterdam', 'utrecht'])
 
 Listing objects support dict-like access with convenient aliases.
 
+**Basic info:**
+
 ```python
-listing['title']        # Property title/address
-listing['city']         # City name
-listing['price']        # Numeric price
-listing['price_formatted']  # Formatted price string
-listing['bedrooms']     # Number of bedrooms
-listing['living_area']  # Living area
-listing['energy_label'] # Energy label (A, B, C, etc.)
-listing['object_type']  # House, Apartment, etc.
-listing['coordinates']  # (lat, lng) tuple
-listing['photos']       # List of photo IDs
-listing['url']          # Funda URL
+listing['title']            # Property title/address
+listing['city']             # City name
+listing['postcode']         # Postal code
+listing['province']         # Province
+listing['neighbourhood']    # Neighbourhood name
+listing['municipality']     # Municipality (gemeente)
+listing['house_number']     # House number
+listing['house_number_ext'] # House number extension (e.g., "A", "II")
+```
+
+**Price & Status:**
+
+```python
+listing['price']            # Numeric price
+listing['price_formatted']  # Formatted price string (e.g., "€ 450.000 k.k.")
+listing['price_per_m2']     # Price per m² (from characteristics)
+listing['status']           # "available" or "sold"
+listing['offering_type']    # "Sale" or "Rent"
+```
+
+**Property details:**
+
+```python
+listing['object_type']      # House, Apartment, etc.
+listing['house_type']       # Type of house (e.g., "Tussenwoning")
+listing['construction_type'] # New or existing construction
+listing['construction_year'] # Year built
+listing['bedrooms']         # Number of bedrooms
+listing['rooms']            # Total number of rooms
+listing['living_area']      # Living area in m²
+listing['plot_area']        # Plot area in m²
+listing['energy_label']     # Energy label (A, B, C, etc.)
+listing['description']      # Full description text
+```
+
+**Dates:**
+
+```python
+listing['publication_date'] # When listed on Funda
+listing['offered_since']    # "Offered since" date (from characteristics)
+listing['acceptance']       # Acceptance terms (e.g., "In overleg")
+```
+
+**Location:**
+
+```python
+listing['coordinates']      # (lat, lng) tuple
+listing['latitude']         # Latitude
+listing['longitude']        # Longitude
+listing['google_maps_url']  # Direct Google Maps link
+```
+
+**Media:**
+
+```python
+listing['photos']           # List of photo IDs
+listing['photo_urls']       # List of full CDN URLs for photos
+listing['photo_count']      # Number of photos
+listing['floorplans']       # List of floorplan IDs
+listing['floorplan_urls']   # List of full CDN URLs for floorplans
+listing['videos']           # List of video IDs
+listing['video_urls']       # List of video URLs
+listing['photos_360']       # List of 360° photo dicts with name, id, url
+listing['brochure_url']     # PDF brochure URL (if available)
+```
+
+**Property features (booleans):**
+
+```python
+listing['has_garden']           # Has garden
+listing['has_balcony']          # Has balcony
+listing['has_roof_terrace']     # Has roof terrace
+listing['has_solar_panels']     # Has solar panels
+listing['has_heat_pump']        # Has heat pump
+listing['has_parking_on_site']  # Parking on property
+listing['has_parking_enclosed'] # Enclosed parking
+listing['is_energy_efficient']  # Energy efficient property
+listing['is_monument']          # Listed/protected building
+listing['is_fixer_upper']       # Fixer-upper (kluswoning)
+listing['is_auction']           # Sold via auction
+listing['open_house']           # Has open house scheduled
+```
+
+**Stats & metadata:**
+
+```python
+listing['views']            # Number of views on Funda
+listing['saves']            # Number of times saved
+listing['highlight']        # Highlight text (blikvanger)
+listing['global_id']        # Internal Funda ID
+listing['tiny_id']          # Public ID (used in URLs)
+listing['url']              # Full Funda URL
+listing['share_url']        # Shareable URL
+listing['broker_id']        # Broker ID
+listing['broker_association'] # Broker association (e.g., "NVM")
+listing['characteristics']  # Dict of all detailed characteristics
 ```
 
 **Key aliases** - these all work:
@@ -164,6 +281,58 @@ results = f.search_listing(
 print(f"Found {len(results)} rentals")
 ```
 
+### Find energy-efficient homes with a garden
+
+```python
+from funda import Funda
+
+f = Funda()
+listing = f.get_listing(43117443)
+
+# Check property features
+if listing['has_garden'] and listing.get('has_solar_panels'):
+    print("Energy efficient with garden!")
+
+if listing['is_energy_efficient']:
+    print(f"Energy label: {listing['energy_label']}")
+```
+
+### Download listing photos
+
+```python
+from funda import Funda
+import requests
+
+f = Funda()
+listing = f.get_listing(43117443)
+
+# Photo URLs are ready to use
+for i, url in enumerate(listing['photo_urls'][:5]):
+    response = requests.get(url)
+    with open(f"photo_{i}.jpg", "wb") as file:
+        file.write(response.content)
+
+# Also available: floorplan_urls, video_urls
+```
+
+### Search by radius from postcode
+
+```python
+from funda import Funda
+
+f = Funda()
+results = f.search_listing(
+    location='1012AB',
+    radius_km=15,
+    price_max=600000,
+    energy_label=['A', 'A+', 'A++'],
+    sort='newest',
+)
+
+for r in results:
+    print(f"{r['title']} - €{r['price']:,}")
+```
+
 ## How It Works
 
 This library uses Funda's undocumented mobile app API, which provides clean JSON responses unlike the website that embeds data in Nuxt.js/JavaScript bundles.
@@ -210,14 +379,20 @@ Search uses Elasticsearch's [Multi Search Template API](https://www.elastic.co/g
 | Parameter | Description | Example |
 |-----------|-------------|---------|
 | `selected_area` | Location filter | `["amsterdam"]` |
+| `radius_search` | Radius from location | `{"index": "geo-wonen-alias-prod", "id": "1012AB-0", "path": "area_with_radius.10"}` |
 | `offering_type` | Buy or rent | `"buy"` or `"rent"` |
 | `price.selling_price` | Price range (buy) | `{"from": 200000, "to": 500000}` |
 | `price.rent_price` | Price range (rent) | `{"from": 500, "to": 2000}` |
 | `object_type` | Property types | `["house", "apartment"]` |
 | `floor_area` | Living area m² | `{"from": 50, "to": 150}` |
+| `plot_area` | Plot area m² | `{"from": 100, "to": 500}` |
+| `energy_label` | Energy labels | `["A", "A+", "A++"]` |
+| `sort` | Sort order | `{"field": "publish_date_utc", "order": "desc"}` |
 | `page.from` | Pagination offset | `0`, `15`, `30`... |
 
 Results are paginated with 15 listings per page.
+
+**Valid radius values:** 1, 2, 5, 10, 15, 30, 50 km (other values are not indexed).
 
 ### Required Headers
 
@@ -231,13 +406,18 @@ Content-Type: application/json
 
 Listing responses include:
 - **Identifiers** - globalId, tinyId
-- **AddressDetails** - title, city, postcode, province, neighbourhood
-- **Price** - numeric and formatted prices (selling or rental)
-- **FastView** - bedrooms, living area, energy label
-- **Media** - photo IDs, floorplans, videos
-- **KenmerkSections** - detailed property characteristics
+- **AddressDetails** - title, city, postcode, province, neighbourhood, house number
+- **Price** - numeric and formatted prices (selling or rental), auction flag
+- **FastView** - bedrooms, living area, plot area, energy label
+- **Media** - photos, floorplans, videos, 360° photos, brochure URL (all with CDN base URLs)
+- **KenmerkSections** - detailed property characteristics (70+ fields)
 - **Coordinates** - latitude/longitude
 - **ObjectInsights** - view and save counts
+- **Advertising.TargetingOptions** - boolean features (garden, balcony, solar panels, heat pump, parking, etc.), construction year, room counts
+- **Share** - shareable URL
+- **GoogleMapsObjectUrl** - direct Google Maps link
+- **PublicationDate** - when the listing was published
+- **Tracking.Values.brokers** - broker ID and association
 
 ## License
 
