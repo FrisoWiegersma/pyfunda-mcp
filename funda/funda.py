@@ -324,6 +324,9 @@ class Funda:
         plot_max: int | None = None,
         object_type: list[str] | None = None,
         energy_label: list[str] | None = None,
+        construction_type: str | list[str] | None = None,
+        construction_year_min: int | None = None,
+        construction_year_max: int | None = None,
         radius_km: int | None = None,
         sort: str | None = None,
         page: int = 0,
@@ -343,6 +346,9 @@ class Funda:
             plot_max: Maximum plot area in m²
             object_type: Property types (e.g. ["house", "apartment"])
             energy_label: Energy labels (e.g. ["A", "A+", "A++"])
+            construction_type: "resale" or "newly_built", or a list of both
+            construction_year_min: Minimum construction year (maps to Funda periods)
+            construction_year_max: Maximum construction year (maps to Funda periods)
             radius_km: Search radius in km (use with single location/postcode)
             sort: Sort order - "newest", "oldest", "price_asc", "price_desc",
                   "area_asc", "area_desc", "plot_desc", "city", "postcode", or None
@@ -448,6 +454,41 @@ class Funda:
         # Energy label filter
         if energy_label:
             params["energy_label"] = energy_label
+
+        # Construction type filter
+        if construction_type:
+            if isinstance(construction_type, str):
+                params["construction_type"] = [construction_type]
+            else:
+                params["construction_type"] = list(construction_type)
+
+        # Construction year filter (mapped to Funda's predefined periods)
+        if construction_year_min is not None or construction_year_max is not None:
+            period_boundaries = [1906, 1931, 1945, 1960, 1971, 1981, 1991, 2001, 2011, 2021]
+            all_periods = (
+                ["before_1906"]
+                + [f"from_{period_boundaries[i]}_to_{period_boundaries[i+1]-1}" for i in range(len(period_boundaries) - 1)]
+                + ["after_2020"]
+            )
+            # Map each period to its year range for filtering
+            period_ranges = {
+                "before_1906": (0, 1905),
+                "from_1906_to_1930": (1906, 1930),
+                "from_1931_to_1944": (1931, 1944),
+                "from_1945_to_1959": (1945, 1959),
+                "from_1960_to_1970": (1960, 1970),
+                "from_1971_to_1980": (1971, 1980),
+                "from_1981_to_1990": (1981, 1990),
+                "from_1991_to_2000": (1991, 2000),
+                "from_2001_to_2010": (2001, 2010),
+                "from_2011_to_2020": (2011, 2020),
+                "after_2020": (2021, 9999),
+            }
+            year_min = construction_year_min or 0
+            year_max = construction_year_max or 9999
+            selected = [p for p in all_periods if period_ranges[p][1] >= year_min and period_ranges[p][0] <= year_max]
+            if selected:
+                params["construction_period"] = selected
 
         # Build NDJSON query
         index_line = json.dumps({"index": "listings-wonen-searcher-alias-prod"})
