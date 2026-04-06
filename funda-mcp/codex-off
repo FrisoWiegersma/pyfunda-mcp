@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVER_NAME="funda"
+CONFIG_PATH="${HOME}/.codex/config.toml"
+
+if [[ ! -f "${CONFIG_PATH}" ]]; then
+  echo "Missing ${CONFIG_PATH}." >&2
+  exit 1
+fi
+
+python - "${CONFIG_PATH}" "${SERVER_NAME}" <<'PY'
+from pathlib import Path
+import sys
+
+config_path = Path(sys.argv[1])
+server_name = sys.argv[2]
+text = config_path.read_text()
+lines = text.splitlines(keepends=True)
+header = f"[mcp_servers.{server_name}]"
+filtered: list[str] = []
+skipping = False
+for line in lines:
+    stripped = line.strip()
+    if stripped == header:
+        skipping = True
+        continue
+    if skipping and stripped.startswith("["):
+        skipping = False
+    if not skipping:
+        filtered.append(line)
+updated = "".join(filtered).rstrip()
+if updated:
+    updated += "\n"
+config_path.write_text(updated)
+PY
+
+echo "Disabled Codex MCP server '${SERVER_NAME}'."

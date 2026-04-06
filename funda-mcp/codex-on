@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SERVER_CMD="${SCRIPT_DIR}/run"
+SERVER_NAME="funda"
+CONFIG_PATH="${HOME}/.codex/config.toml"
+
+if [[ ! -f "${CONFIG_PATH}" ]]; then
+  echo "Missing ${CONFIG_PATH}. Run Codex once first." >&2
+  exit 1
+fi
+
+python - "${CONFIG_PATH}" "${SERVER_NAME}" "${SERVER_CMD}" <<'PY'
+from pathlib import Path
+import sys
+
+config_path = Path(sys.argv[1])
+server_name = sys.argv[2]
+server_cmd = sys.argv[3]
+text = config_path.read_text() if config_path.exists() else ""
+lines = text.splitlines(keepends=True)
+header = f"[mcp_servers.{server_name}]"
+filtered: list[str] = []
+skipping = False
+for line in lines:
+    stripped = line.strip()
+    if stripped == header:
+        skipping = True
+        continue
+    if skipping and stripped.startswith("["):
+        skipping = False
+    if not skipping:
+        filtered.append(line)
+text = "".join(filtered).rstrip()
+if text:
+    text += "\n\n"
+text += f"[mcp_servers.{server_name}]\ncommand = {server_cmd!r}\n"
+config_path.write_text(text)
+PY
+
+echo "Enabled Codex MCP server '${SERVER_NAME}'."
