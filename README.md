@@ -48,6 +48,22 @@ Funda has no public API. If you want Dutch real estate data programmatically, yo
 pip install pyfunda
 ```
 
+## MCP Server
+
+This repository also includes a local MCP server in [`funda-mcp/`](./funda-mcp).
+
+It exposes the stable `pyfunda` API as MCP tools for clients such as Codex and Claude Code.
+
+From a local checkout:
+
+```bash
+.venv/bin/pip install -e ".[mcp]"
+```
+
+Main MCP docs:
+
+- [`funda-mcp/README.md`](./funda-mcp/README.md)
+
 ## Quick Start
 
 ```python
