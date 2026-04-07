@@ -27,10 +27,24 @@ Codex:
 codex mcp list
 ```
 
+Turn it off:
+
+```bash
+./funda-mcp/codex-off
+codex mcp list
+```
+
 Claude Code:
 
 ```bash
 claude mcp add --transport stdio funda -- /absolute/path/to/repo/funda-mcp/run
+claude mcp list
+```
+
+Turn it off:
+
+```bash
+claude mcp remove funda
 claude mcp list
 ```
 
