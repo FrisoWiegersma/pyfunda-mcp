@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
@@ -12,6 +13,7 @@ from threading import RLock
 import time
 from typing import Annotated, Any, Literal
 import sys
+import unicodedata
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -21,6 +23,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel, Field
 
 from funda.funda import API_SEARCH, Funda, _make_headers
+from woz_client import WozClient
 
 AvailabilityValue = Literal["available", "negotiations", "sold", "unavailable"]
 ConstructionTypeValue = Literal["resale", "newly_built"]
@@ -43,6 +46,7 @@ MAX_POLL_RESULTS = 50
 
 LISTING_ID_PATTERN = re.compile(r"^\d{7,9}$")
 FUNDA_URL_PATTERN = re.compile(r"^https?://(?:www\.)?funda\.nl/", re.IGNORECASE)
+ISO_DATE_PREFIX_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}")
 VALID_AVAILABILITY = {"available", "negotiations", "sold", "unavailable"}
 VALID_CONSTRUCTION_TYPES = {"resale", "newly_built"}
 VALID_OFFERING_TYPES = {"buy", "rent"}
@@ -58,6 +62,25 @@ VALID_SORT_VALUES = {
     "postcode",
 }
 VALID_RADII = [1, 2, 5, 10, 15, 30, 50]
+POSTCODE_PATTERN = re.compile(r"^\d{4}[A-Z]{2}$")
+POSTCODE_PREFIX_PATTERN = re.compile(r"^\d{4}$")
+
+CITY_ALIAS_MAP = {
+    "'s gravenhage": "den-haag",
+    "den haag": "den-haag",
+    "s gravenhage": "den-haag",
+    "the hague": "den-haag",
+}
+
+NEIGHBOURHOOD_FALLBACKS = {
+    "benoordenhout": {
+        "anchor": "2596BG",
+        "default_radius_km": 1,
+        "notes": [
+            "Neighbourhood resolution uses a curated postcode anchor and radius fallback because Funda does not expose stable neighbourhood slugs through this MCP.",
+        ],
+    },
+}
 
 
 class ListingResponse(BaseModel):
@@ -69,6 +92,9 @@ class SearchListingsResponse(BaseModel):
     returned_count: int = Field(description="Number of listings returned in this page.")
     applied_filters: dict[str, Any] = Field(
         description="Normalized search filters used by this MCP server, including defaults."
+    )
+    search_resolution: dict[str, Any] = Field(
+        description="How the MCP resolved the caller's location input into the upstream Funda search request."
     )
     results: list[dict[str, Any]] = Field(description="Listing summaries returned by the search API.")
 
@@ -88,6 +114,48 @@ class PriceHistoryResponse(BaseModel):
     changes: list[dict[str, Any]] = Field(description="Historical price events.")
 
 
+class WozHistoryResponse(BaseModel):
+    resolved_address: dict[str, Any] = Field(description="Normalized address resolved by Kadaster.")
+    match: dict[str, Any] = Field(description="Identifiers used for the resolved WOZ object.")
+    count: int = Field(description="Number of WOZ history records returned.")
+    history: list[dict[str, Any]] = Field(description="Historical WOZ values ordered by peildatum descending.")
+    current_woz_value: int | None = Field(description="Most recent WOZ value when available.")
+    metadata: dict[str, Any] = Field(description="Additional Kadaster metadata for the resolved object.")
+
+
+class GrossYieldResponse(BaseModel):
+    resolved_address: dict[str, Any] = Field(description="Address used for the WOZ lookup.")
+    annual_rent: float = Field(description="Monthly rent multiplied by 12.")
+    acquisition_price: float = Field(description="Purchase price used in the yield calculation.")
+    gross_yield_pct: float = Field(description="Gross yield percentage based on annual rent and acquisition price.")
+    current_woz_value: int | None = Field(description="Most recent WOZ value when available.")
+    price_to_current_woz_ratio: float | None = Field(description="Acquisition price divided by the current WOZ value.")
+    woz_growth_abs: int | None = Field(description="Absolute WOZ growth between the oldest and newest known values.")
+    woz_growth_pct: float | None = Field(description="Percentage WOZ growth between the oldest and newest known values.")
+    history_years: int = Field(description="Number of WOZ history rows considered.")
+    woz_history: list[dict[str, Any]] = Field(description="WOZ history rows used in the calculation.")
+
+
+class GrowthRoiResponse(BaseModel):
+    resolved_address: dict[str, Any] = Field(description="Address used for the WOZ lookup.")
+    acquisition_price: float | None = Field(
+        description="Purchase price used for comparison fields when provided or derived from a listing."
+    )
+    current_woz_value: int = Field(description="Most recent WOZ value in the selected history window.")
+    start_woz_value: int = Field(description="Oldest WOZ value in the selected history window.")
+    end_woz_value: int = Field(description="Newest WOZ value in the selected history window.")
+    start_year: int = Field(description="Oldest WOZ year included in the calculation.")
+    end_year: int = Field(description="Newest WOZ year included in the calculation.")
+    history_years: int = Field(description="Number of yearly WOZ rows considered.")
+    total_growth_abs: int = Field(description="Absolute WOZ growth over the selected period.")
+    total_growth_pct: float | None = Field(description="Percentage WOZ growth over the selected period.")
+    average_yoy_growth_pct: float | None = Field(description="Arithmetic mean of the year-over-year WOZ growth percentages.")
+    cagr_pct: float | None = Field(description="Compound annual growth rate over the selected period.")
+    price_to_current_woz_ratio: float | None = Field(description="Acquisition price divided by the current WOZ value.")
+    yearly_growth: list[dict[str, Any]] = Field(description="Year-over-year WOZ growth rows ordered by year descending.")
+    woz_history: list[dict[str, Any]] = Field(description="WOZ history rows used in the growth calculation.")
+
+
 _MODEL_TYPES = {"Any": Any}
 for model in (
     ListingResponse,
@@ -95,6 +163,9 @@ for model in (
     LatestIdResponse,
     PollNewListingsResponse,
     PriceHistoryResponse,
+    WozHistoryResponse,
+    GrossYieldResponse,
+    GrowthRoiResponse,
 ):
     model.model_rebuild(_types_namespace=_MODEL_TYPES)
 
@@ -152,6 +223,200 @@ def _normalize_location(value: str | Iterable[str] | None) -> list[str] | None:
     return normalized or None
 
 
+def _normalize_search_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    normalized = normalized.lower()
+    normalized = normalized.replace("&", " ")
+    normalized = re.sub(r"[’']", "", normalized)
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _slugify_search_text(value: str) -> str:
+    normalized = _normalize_search_text(value)
+    return normalized.replace(" ", "-")
+
+
+def _normalize_postcode_token(value: str) -> str | None:
+    compact = re.sub(r"\s+", "", value).upper()
+    if POSTCODE_PATTERN.fullmatch(compact):
+        return compact
+    return None
+
+
+def _contains_alias(haystack: str, alias: str) -> bool:
+    padded_haystack = f" {haystack} "
+    padded_alias = f" {alias} "
+    return padded_alias in padded_haystack
+
+
+@dataclass(frozen=True)
+class ResolvedSearch:
+    location: list[str] | None
+    radius_km: int | None
+    strategy: str
+    confidence: str
+    notes: list[str]
+    original_location: list[str] | None
+
+    def as_metadata(self) -> dict[str, Any]:
+        mode = "none"
+        if self.location:
+            mode = "radius_search" if self.radius_km is not None and len(self.location) == 1 else "selected_area"
+        return {
+            "original_location": self.original_location,
+            "resolved_location": self.location,
+            "mode": mode,
+            "strategy": self.strategy,
+            "confidence": self.confidence,
+            "radius_km": self.radius_km,
+            "notes": list(self.notes),
+        }
+
+
+def _resolve_single_location(token: str, *, radius_km: int | None) -> ResolvedSearch:
+    compact_postcode = _normalize_postcode_token(token)
+    original = [token]
+    if compact_postcode is not None:
+        return ResolvedSearch(
+            location=[compact_postcode.lower()],
+            radius_km=radius_km,
+            strategy="exact_postcode",
+            confidence="high",
+            notes=[],
+            original_location=original,
+        )
+
+    normalized = _normalize_search_text(token)
+    if not normalized:
+        return ResolvedSearch(None, radius_km, "empty", "low", [], original)
+
+    if POSTCODE_PREFIX_PATTERN.fullmatch(normalized):
+        return ResolvedSearch(
+            location=[normalized],
+            radius_km=radius_km,
+            strategy="postcode_prefix",
+            confidence="high",
+            notes=[],
+            original_location=original,
+        )
+
+    for alias, fallback in NEIGHBOURHOOD_FALLBACKS.items():
+        if _contains_alias(normalized, alias):
+            effective_radius = radius_km or fallback["default_radius_km"]
+            notes = list(fallback.get("notes", []))
+            if radius_km is None:
+                notes.append(f"Used the default {effective_radius} km radius for this neighbourhood fallback.")
+            return ResolvedSearch(
+                location=[fallback["anchor"].lower()],
+                radius_km=effective_radius,
+                strategy="neighbourhood_fallback",
+                confidence="medium",
+                notes=notes,
+                original_location=original,
+            )
+
+    city_slug = CITY_ALIAS_MAP.get(normalized)
+    if city_slug is not None:
+        return ResolvedSearch(
+            location=[city_slug],
+            radius_km=radius_km,
+            strategy="city_alias",
+            confidence="high",
+            notes=[],
+            original_location=original,
+        )
+
+    if " " in normalized and not any(char.isdigit() for char in normalized):
+        slug = _slugify_search_text(token)
+        if slug:
+            return ResolvedSearch(
+                location=[slug],
+                radius_km=radius_km,
+                strategy="slugified_text",
+                confidence="medium",
+                notes=["Sent a slugified location token upstream because no curated alias matched."],
+                original_location=original,
+            )
+
+    passthrough = token.strip().lower()
+    return ResolvedSearch(
+        location=[passthrough] if passthrough else None,
+        radius_km=radius_km,
+        strategy="passthrough",
+        confidence="low",
+        notes=["Sent the location upstream unchanged because no deterministic resolver matched."],
+        original_location=original,
+    )
+
+
+def _resolve_search_location(location: list[str] | None, *, radius_km: int | None) -> ResolvedSearch:
+    if not location:
+        return ResolvedSearch(None, radius_km, "none", "high", [], None)
+    if len(location) == 1:
+        return _resolve_single_location(location[0], radius_km=radius_km)
+
+    resolved_locations: list[str] = []
+    notes: list[str] = []
+    for token in location:
+        resolved = _resolve_single_location(token, radius_km=None)
+        notes.extend(resolved.notes)
+        if resolved.location:
+            resolved_locations.extend(resolved.location)
+    effective_radius_km = None
+    if radius_km is not None:
+        notes.append("Ignored radius_km because Funda radius search only supports a single resolved location.")
+
+    return ResolvedSearch(
+        location=resolved_locations or location,
+        radius_km=effective_radius_km,
+        strategy="multi_location",
+        confidence="medium",
+        notes=notes,
+        original_location=list(location),
+    )
+
+
+def _augment_search_resolution(metadata: dict[str, Any], *, returned_count: int) -> dict[str, Any]:
+    notes = list(metadata.get("notes") or [])
+    if returned_count == 0 and metadata.get("strategy") in {"passthrough", "slugified_text", "multi_location"}:
+        notes.append(
+            "Search returned zero results. If this was meant to be a neighbourhood, prefer a postcode or add a curated alias."
+        )
+    metadata["notes"] = notes
+    return metadata
+
+
+def _coerce_house_number(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        match = re.match(r"^\s*(\d+)", value)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _is_funda_fingerprint_error(exc: Exception) -> bool:
+    return "No working fingerprint found" in str(exc)
+
+
+def _funda_operation_error(operation: str, exc: Exception) -> RuntimeError:
+    message = str(exc).strip() or exc.__class__.__name__
+    if _is_funda_fingerprint_error(exc):
+        return RuntimeError(
+            f"Live Funda {operation} is currently unavailable: the upstream fingerprint is outdated. "
+            "The MCP is running in degraded mode. Retry later or use direct WOZ tools where possible."
+        )
+    if "Search failed" in message:
+        return RuntimeError(
+            f"Live Funda {operation} failed upstream: {message}. "
+            "The MCP is running in degraded mode."
+        )
+    return RuntimeError(f"Live Funda {operation} is currently unavailable: {message}")
+
+
 def _positive_int(name: str, value: int, minimum: int = 1, maximum: int | None = None) -> int:
     if value < minimum:
         raise ValueError(f"{name} must be >= {minimum}")
@@ -185,9 +450,229 @@ def _jsonify(value: Any) -> Any:
     return value
 
 
+def _format_euro(value: int | float | None) -> str | None:
+    if value is None:
+        return None
+    return f"€{int(round(float(value))):,}".replace(",", ".")
+
+
+def _change_year(change: dict[str, Any]) -> int | None:
+    for key in ("peildatum", "timestamp", "date"):
+        value = change.get(key)
+        if isinstance(value, str) and len(value) >= 4 and value[:4].isdigit():
+            return int(value[:4])
+    return None
+
+
+def _change_sort_key(change: dict[str, Any]) -> str:
+    for key in ("timestamp", "peildatum", "date"):
+        value = change.get(key)
+        if isinstance(value, str) and ISO_DATE_PREFIX_PATTERN.match(value):
+            return value[:10]
+    return ""
+
+
+def _kadaster_history_to_changes(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    changes = []
+    for row in history:
+        peildatum = row.get("peildatum")
+        value = row.get("woz_value")
+        if not isinstance(peildatum, str) or not isinstance(value, int):
+            continue
+        changes.append(
+            {
+                "date": peildatum,
+                "timestamp": f"{peildatum}T00:00:00",
+                "price": value,
+                "human_price": _format_euro(value),
+                "status": "woz",
+                "source": "WOZ Waardeloket",
+                "peildatum": peildatum,
+            }
+        )
+    return changes
+
+
+def _merge_price_history_with_woz(changes: list[dict[str, Any]], history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    kadaster_years = {row["year"] for row in history if isinstance(row.get("year"), int)}
+    merged = [
+        dict(change)
+        for change in changes
+        if not (change.get("status") == "woz" and _change_year(change) in kadaster_years)
+    ]
+    merged.extend(_kadaster_history_to_changes(history))
+    return sorted(merged, key=_change_sort_key, reverse=True)
+
+
+def _select_growth_history(history: list[dict[str, Any]], *, years: int | None = None) -> list[dict[str, Any]]:
+    selected = [
+        row
+        for row in history
+        if isinstance(row.get("peildatum"), str)
+        and isinstance(row.get("woz_value"), int)
+        and isinstance(row.get("year"), int)
+    ]
+    if years is not None:
+        years = _positive_int("years", years, minimum=2)
+        selected = selected[:years]
+    if len(selected) < 2:
+        raise ValueError("Growth ROI requires at least two yearly WOZ values")
+    return selected
+
+
+def _growth_metrics_from_history(history: list[dict[str, Any]]) -> dict[str, Any]:
+    newest = history[0]
+    oldest = history[-1]
+    newest_value = newest["woz_value"]
+    oldest_value = oldest["woz_value"]
+    total_growth_abs = newest_value - oldest_value
+    total_growth_pct = round((total_growth_abs / oldest_value) * 100, 4) if oldest_value > 0 else None
+
+    yearly_growth: list[dict[str, Any]] = []
+    yearly_growth_pcts: list[float] = []
+    for index in range(len(history) - 1):
+        current = history[index]
+        previous = history[index + 1]
+        growth_abs = current["woz_value"] - previous["woz_value"]
+        growth_pct = round((growth_abs / previous["woz_value"]) * 100, 4) if previous["woz_value"] > 0 else None
+        if growth_pct is not None:
+            yearly_growth_pcts.append(growth_pct)
+        yearly_growth.append(
+            {
+                "year": current["year"],
+                "peildatum": current["peildatum"],
+                "woz_value": current["woz_value"],
+                "previous_year": previous["year"],
+                "previous_peildatum": previous["peildatum"],
+                "previous_woz_value": previous["woz_value"],
+                "growth_abs": growth_abs,
+                "growth_pct": growth_pct,
+            }
+        )
+
+    cagr_pct = None
+    if oldest_value > 0:
+        intervals = len(history) - 1
+        cagr_pct = round((((newest_value / oldest_value) ** (1 / intervals)) - 1) * 100, 4)
+
+    return {
+        "current_woz_value": newest_value,
+        "start_woz_value": oldest_value,
+        "end_woz_value": newest_value,
+        "start_year": oldest["year"],
+        "end_year": newest["year"],
+        "history_years": len(history),
+        "total_growth_abs": total_growth_abs,
+        "total_growth_pct": total_growth_pct,
+        "average_yoy_growth_pct": round(sum(yearly_growth_pcts) / len(yearly_growth_pcts), 4) if yearly_growth_pcts else None,
+        "cagr_pct": cagr_pct,
+        "yearly_growth": yearly_growth,
+    }
+
+
+def _street_from_listing(listing: dict[str, Any]) -> str | None:
+    street_name = listing.get("street_name")
+    if isinstance(street_name, str) and street_name.strip():
+        return street_name.strip()
+    title = listing.get("title")
+    house_number = _coerce_house_number(listing.get("house_number"))
+    if not isinstance(title, str) or not title.strip():
+        return None
+    if not isinstance(house_number, int):
+        return None
+    match = re.match(rf"^(?P<street>.+?)\s+{re.escape(str(house_number))}(?:\b|$)", title.strip())
+    if match:
+        street = match.group("street").strip()
+        return street or None
+    return title.strip()
+
+
+def _listing_woz_address_variants(listing: dict[str, Any]) -> list[dict[str, Any]]:
+    street = _street_from_listing(listing)
+    house_number = _coerce_house_number(listing.get("house_number"))
+    postcode = listing.get("postcode")
+    city = listing.get("city")
+    if not street or not isinstance(house_number, int) or not isinstance(postcode, str) or not isinstance(city, str):
+        return []
+
+    base = {
+        "street": street,
+        "house_number": house_number,
+        "postcode": postcode,
+        "city": city,
+    }
+    variants = [base]
+    extension = listing.get("house_number_ext") or listing.get("house_number_suffix")
+    if isinstance(extension, str) and extension.strip():
+        suffix = extension.strip()
+        variants.insert(0, {**base, "house_number_suffix": suffix})
+        normalized_extension = re.sub(r"\s+", "", suffix)
+        if len(normalized_extension) == 1 and normalized_extension.isalpha():
+            variants.insert(1, {**base, "house_letter": normalized_extension})
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for variant in variants:
+        key = (
+            variant["street"],
+            variant["house_number"],
+            variant["postcode"],
+            variant["city"],
+            variant.get("house_letter"),
+            variant.get("house_number_suffix"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(variant)
+    return deduped
+
+
+def _listing_address_snapshot(listing: dict[str, Any]) -> dict[str, Any]:
+    snapshot = {
+        "title": listing.get("title"),
+        "street": _street_from_listing(listing),
+        "house_number": _coerce_house_number(listing.get("house_number")),
+        "house_number_ext": listing.get("house_number_ext") or listing.get("house_number_suffix"),
+        "postcode": listing.get("postcode"),
+        "city": listing.get("city"),
+    }
+    return {key: value for key, value in snapshot.items() if value is not None}
+
+
+def _listing_woz_lookup_error(listing: dict[str, Any], exc: Exception) -> LookupError:
+    snapshot = _listing_address_snapshot(listing)
+    missing = [field for field in ("street", "house_number", "postcode", "city") if snapshot.get(field) in (None, "")]
+    details = ", ".join(f"{key}={value!r}" for key, value in snapshot.items()) or "no address fields extracted"
+    if missing:
+        reason = f"missing normalized fields: {', '.join(missing)}"
+    else:
+        reason = str(exc).strip() or exc.__class__.__name__
+    return LookupError(
+        "Could not derive a unique WOZ address from the listing. "
+        "Provide street, house_number, postcode, and city explicitly. "
+        f"Reason: {reason}. Extracted fields: {details}."
+    )
+
+
+def _listing_price(listing: dict[str, Any]) -> float | None:
+    price = listing.get("price")
+    if isinstance(price, bool) or price is None:
+        return None
+    if isinstance(price, (int, float)):
+        return float(price)
+    if isinstance(price, str):
+        try:
+            return float(price)
+        except ValueError:
+            return None
+    return None
+
+
 class FundaService:
-    def __init__(self, client: Funda):
+    def __init__(self, client: Funda, woz_client: WozClient | None = None):
         self.client = client
+        self.woz_client = woz_client or WozClient()
         self.lock = RLock()
 
     @contextmanager
@@ -203,8 +688,78 @@ class FundaService:
 
     def get_listing(self, listing_id_or_url: str, *, timeout_seconds: int = DEFAULT_TIMEOUT) -> ListingResponse:
         listing_ref = _validate_listing_ref(listing_id_or_url)
-        with self.client_call(timeout_seconds) as client:
-            return ListingResponse(listing=_jsonify(client.get_listing(listing_ref)))
+        try:
+            with self.client_call(timeout_seconds) as client:
+                return ListingResponse(listing=_jsonify(client.get_listing(listing_ref)))
+        except Exception as exc:
+            raise _funda_operation_error("listing access", exc) from exc
+
+    def _get_listing_payload(self, listing_id_or_url: str, *, timeout_seconds: int) -> dict[str, Any]:
+        listing_ref = _validate_listing_ref(listing_id_or_url)
+        try:
+            with self.client_call(timeout_seconds) as client:
+                return _jsonify(client.get_listing(listing_ref))
+        except Exception as exc:
+            raise _funda_operation_error("listing access", exc) from exc
+
+    def _get_woz_history_for_listing(self, listing: dict[str, Any], *, timeout_seconds: int) -> dict[str, Any]:
+        variants = _listing_woz_address_variants(listing)
+        if not variants:
+            raise LookupError("Listing did not contain enough address data for WOZ lookup")
+
+        successes: list[dict[str, Any]] = []
+        success_ids: set[Any] = set()
+        last_error: Exception | None = None
+        for variant in variants:
+            try:
+                payload = self.woz_client.get_woz_history(timeout_seconds=timeout_seconds, **variant)
+            except Exception as exc:
+                last_error = exc
+                continue
+            wozobjectnummer = payload.get("match", {}).get("wozobjectnummer")
+            if wozobjectnummer in success_ids:
+                continue
+            success_ids.add(wozobjectnummer)
+            successes.append(payload)
+
+        if len(successes) == 1:
+            return successes[0]
+        if len(successes) > 1:
+            raise LookupError("Listing resolved to multiple WOZ objects")
+        if last_error is not None:
+            raise last_error
+        raise LookupError("No WOZ history found for listing address")
+
+    def _get_listing_woz_history(self, listing_id_or_url: str, *, timeout_seconds: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        listing = self._get_listing_payload(listing_id_or_url, timeout_seconds=timeout_seconds)
+        try:
+            woz_history = self._get_woz_history_for_listing(listing, timeout_seconds=timeout_seconds)
+        except Exception as exc:
+            raise _listing_woz_lookup_error(listing, exc) from exc
+        return listing, woz_history
+
+    def _get_direct_woz_history(
+        self,
+        *,
+        street: str | None,
+        house_number: int | None,
+        postcode: str | None,
+        city: str | None,
+        house_letter: str | None,
+        house_number_suffix: str | None,
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        if not all(value is not None for value in (street, house_number, postcode, city)):
+            raise ValueError("Provide either listing_id_or_url or a full structured address")
+        return self.woz_client.get_woz_history(
+            street=street,
+            house_number=house_number,
+            postcode=postcode,
+            city=city,
+            house_letter=house_letter,
+            house_number_suffix=house_number_suffix,
+            timeout_seconds=timeout_seconds,
+        )
 
     def _build_search_params(
         self,
@@ -429,15 +984,18 @@ class FundaService:
     ) -> SearchListingsResponse:
         if page < 0:
             raise ValueError("page must be >= 0")
-        location = _normalize_location(location)
+        original_location = _normalize_location(location)
         offering_type = _normalize_choice("offering_type", offering_type, VALID_OFFERING_TYPES) or "buy"
         sort = _normalize_choice("sort", sort, VALID_SORT_VALUES)
         availability = _normalize_list("availability", availability, VALID_AVAILABILITY)
         construction_type = _normalize_list("construction_type", construction_type, VALID_CONSTRUCTION_TYPES)
         object_type = _normalize_list("object_type", object_type)
         energy_label = _normalize_list("energy_label", energy_label)
+        resolved_search = _resolve_search_location(original_location, radius_km=radius_km)
+        resolved_location = resolved_search.location
+        resolved_radius_km = resolved_search.radius_km
         params = self._build_search_params(
-            location=location,
+            location=resolved_location,
             offering_type=offering_type,
             availability=availability,
             price_min=price_min,
@@ -451,35 +1009,38 @@ class FundaService:
             construction_type=construction_type,
             construction_year_min=construction_year_min,
             construction_year_max=construction_year_max,
-            radius_km=radius_km,
+            radius_km=resolved_radius_km,
             sort=sort,
             page=page,
         )
 
-        with self.client_call(timeout_seconds) as client:
-            results = client.search_listing(
-                location=location,
-                offering_type=offering_type,
-                availability=availability,
-                price_min=price_min,
-                price_max=price_max,
-                area_min=area_min,
-                area_max=area_max,
-                plot_min=plot_min,
-                plot_max=plot_max,
-                object_type=object_type,
-                energy_label=energy_label,
-                construction_type=construction_type,
-                construction_year_min=construction_year_min,
-                construction_year_max=construction_year_max,
-                radius_km=radius_km,
-                sort=sort,
-                page=page,
-            )
-        total_count = self._search_total_count(params, timeout_seconds=timeout_seconds)
+        try:
+            with self.client_call(timeout_seconds) as client:
+                results = client.search_listing(
+                    location=resolved_location,
+                    offering_type=offering_type,
+                    availability=availability,
+                    price_min=price_min,
+                    price_max=price_max,
+                    area_min=area_min,
+                    area_max=area_max,
+                    plot_min=plot_min,
+                    plot_max=plot_max,
+                    object_type=object_type,
+                    energy_label=energy_label,
+                    construction_type=construction_type,
+                    construction_year_min=construction_year_min,
+                    construction_year_max=construction_year_max,
+                    radius_km=resolved_radius_km,
+                    sort=sort,
+                    page=page,
+                )
+            total_count = self._search_total_count(params, timeout_seconds=timeout_seconds)
+        except Exception as exc:
+            raise _funda_operation_error("search", exc) from exc
         payload = [_jsonify(listing) for listing in results]
         applied_filters = self._applied_search_filters(
-            location=location,
+            location=resolved_location,
             offering_type=offering_type,
             availability=availability,
             price_min=price_min,
@@ -493,20 +1054,28 @@ class FundaService:
             construction_type=construction_type,
             construction_year_min=construction_year_min,
             construction_year_max=construction_year_max,
-            radius_km=radius_km,
+            radius_km=resolved_radius_km,
             sort=sort,
             page=page,
+        )
+        search_resolution = _augment_search_resolution(
+            resolved_search.as_metadata(),
+            returned_count=len(payload),
         )
         return SearchListingsResponse(
             total_count=total_count,
             returned_count=len(payload),
             applied_filters=applied_filters,
+            search_resolution=search_resolution,
             results=payload,
         )
 
     def get_latest_id(self, *, timeout_seconds: int = DEFAULT_TIMEOUT) -> LatestIdResponse:
-        with self.client_call(timeout_seconds) as client:
-            return LatestIdResponse(latest_id=client.get_latest_id())
+        try:
+            with self.client_call(timeout_seconds) as client:
+                return LatestIdResponse(latest_id=client.get_latest_id())
+        except Exception as exc:
+            raise _funda_operation_error("latest-id lookup", exc) from exc
 
     def poll_new_listings(
         self,
@@ -525,26 +1094,194 @@ class FundaService:
 
         results: list[dict[str, Any]] = []
         last_seen_id = since_id
-        with self.client_call(timeout_seconds) as client:
-            for listing in client.poll_new_listings(
-                since_id=since_id,
-                max_consecutive_404s=max_consecutive_404s,
-                offering_type=offering_type,
-            ):
-                item = _jsonify(listing)
-                results.append(item)
-                global_id = item.get("global_id")
-                if isinstance(global_id, int):
-                    last_seen_id = max(last_seen_id, global_id)
-                if len(results) >= max_results:
-                    break
+        try:
+            with self.client_call(timeout_seconds) as client:
+                for listing in client.poll_new_listings(
+                    since_id=since_id,
+                    max_consecutive_404s=max_consecutive_404s,
+                    offering_type=offering_type,
+                ):
+                    item = _jsonify(listing)
+                    results.append(item)
+                    global_id = item.get("global_id")
+                    if isinstance(global_id, int):
+                        last_seen_id = max(last_seen_id, global_id)
+                    if len(results) >= max_results:
+                        break
+        except Exception as exc:
+            raise _funda_operation_error("new-listing polling", exc) from exc
         return PollNewListingsResponse(count=len(results), results=results, last_seen_id=last_seen_id)
 
     def get_price_history(self, listing_id_or_url: str, *, timeout_seconds: int = DEFAULT_TIMEOUT) -> PriceHistoryResponse:
         listing_ref = _validate_listing_ref(listing_id_or_url)
-        with self.client_call(timeout_seconds) as client:
-            changes = _jsonify(client.get_price_history(listing_ref))
+        try:
+            with self.client_call(timeout_seconds) as client:
+                changes = _jsonify(client.get_price_history(listing_ref))
+        except Exception as exc:
+            if _is_funda_fingerprint_error(exc):
+                raise _funda_operation_error("price-history lookup", exc) from exc
+            raise
+        try:
+            listing = self._get_listing_payload(listing_ref, timeout_seconds=timeout_seconds)
+            woz_history = self._get_woz_history_for_listing(listing, timeout_seconds=timeout_seconds)
+        except Exception:
+            pass
+        else:
+            changes = _merge_price_history_with_woz(changes, woz_history["history"])
         return PriceHistoryResponse(count=len(changes), changes=changes)
+
+    def get_woz_history(
+        self,
+        *,
+        street: str,
+        house_number: int,
+        postcode: str,
+        city: str,
+        house_letter: str | None = None,
+        house_number_suffix: str | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT,
+    ) -> WozHistoryResponse:
+        timeout_seconds = _positive_int("timeout_seconds", timeout_seconds, minimum=1, maximum=MAX_TIMEOUT)
+        payload = self.woz_client.get_woz_history(
+            street=street,
+            house_number=house_number,
+            postcode=postcode,
+            city=city,
+            house_letter=house_letter,
+            house_number_suffix=house_number_suffix,
+            timeout_seconds=timeout_seconds,
+        )
+        return WozHistoryResponse(**payload)
+
+    def calculate_gross_yield(
+        self,
+        *,
+        monthly_rent: float,
+        listing_id_or_url: str | None = None,
+        acquisition_price: float | None = None,
+        street: str | None = None,
+        house_number: int | None = None,
+        postcode: str | None = None,
+        city: str | None = None,
+        house_letter: str | None = None,
+        house_number_suffix: str | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT,
+    ) -> GrossYieldResponse:
+        timeout_seconds = _positive_int("timeout_seconds", timeout_seconds, minimum=1, maximum=MAX_TIMEOUT)
+        if monthly_rent < 0:
+            raise ValueError("monthly_rent must be >= 0")
+
+        woz_history: dict[str, Any]
+        if listing_id_or_url is not None:
+            listing, woz_history = self._get_listing_woz_history(listing_id_or_url, timeout_seconds=timeout_seconds)
+            if acquisition_price is None:
+                acquisition_price = _listing_price(listing)
+                if acquisition_price is None:
+                    raise ValueError("Listing price is unavailable; provide acquisition_price explicitly")
+        else:
+            if acquisition_price is None:
+                raise ValueError("acquisition_price is required for direct address calculations")
+            woz_history = self._get_direct_woz_history(
+                street=street,
+                house_number=house_number,
+                postcode=postcode,
+                city=city,
+                house_letter=house_letter,
+                house_number_suffix=house_number_suffix,
+                timeout_seconds=timeout_seconds,
+            )
+
+        if acquisition_price is None or acquisition_price <= 0:
+            raise ValueError("acquisition_price must be > 0")
+
+        annual_rent = round(monthly_rent * 12, 2)
+        current_woz_value = woz_history["current_woz_value"]
+        history = woz_history["history"]
+        oldest_value = history[-1]["woz_value"] if history else None
+        woz_growth_abs = None
+        woz_growth_pct = None
+        if isinstance(current_woz_value, int) and isinstance(oldest_value, int):
+            woz_growth_abs = current_woz_value - oldest_value
+            if oldest_value > 0:
+                woz_growth_pct = round((woz_growth_abs / oldest_value) * 100, 4)
+
+        price_to_current_woz_ratio = None
+        if isinstance(current_woz_value, int) and current_woz_value > 0:
+            price_to_current_woz_ratio = round(acquisition_price / current_woz_value, 4)
+
+        return GrossYieldResponse(
+            resolved_address=woz_history["resolved_address"],
+            annual_rent=annual_rent,
+            acquisition_price=round(acquisition_price, 2),
+            gross_yield_pct=round((annual_rent / acquisition_price) * 100, 4),
+            current_woz_value=current_woz_value,
+            price_to_current_woz_ratio=price_to_current_woz_ratio,
+            woz_growth_abs=woz_growth_abs,
+            woz_growth_pct=woz_growth_pct,
+            history_years=len(history),
+            woz_history=history,
+        )
+
+    def calculate_growth_roi(
+        self,
+        *,
+        listing_id_or_url: str | None = None,
+        acquisition_price: float | None = None,
+        years: int | None = None,
+        street: str | None = None,
+        house_number: int | None = None,
+        postcode: str | None = None,
+        city: str | None = None,
+        house_letter: str | None = None,
+        house_number_suffix: str | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT,
+    ) -> GrowthRoiResponse:
+        timeout_seconds = _positive_int("timeout_seconds", timeout_seconds, minimum=1, maximum=MAX_TIMEOUT)
+        if years is not None:
+            years = _positive_int("years", years, minimum=2)
+
+        woz_history: dict[str, Any]
+        if listing_id_or_url is not None:
+            listing, woz_history = self._get_listing_woz_history(listing_id_or_url, timeout_seconds=timeout_seconds)
+            if acquisition_price is None:
+                acquisition_price = _listing_price(listing)
+        else:
+            woz_history = self._get_direct_woz_history(
+                street=street,
+                house_number=house_number,
+                postcode=postcode,
+                city=city,
+                house_letter=house_letter,
+                house_number_suffix=house_number_suffix,
+                timeout_seconds=timeout_seconds,
+            )
+
+        if acquisition_price is not None and acquisition_price <= 0:
+            raise ValueError("acquisition_price must be > 0")
+
+        history = _select_growth_history(woz_history["history"], years=years)
+        metrics = _growth_metrics_from_history(history)
+        price_to_current_woz_ratio = None
+        if acquisition_price is not None and metrics["current_woz_value"] > 0:
+            price_to_current_woz_ratio = round(acquisition_price / metrics["current_woz_value"], 4)
+
+        return GrowthRoiResponse(
+            resolved_address=woz_history["resolved_address"],
+            acquisition_price=round(acquisition_price, 2) if acquisition_price is not None else None,
+            current_woz_value=metrics["current_woz_value"],
+            start_woz_value=metrics["start_woz_value"],
+            end_woz_value=metrics["end_woz_value"],
+            start_year=metrics["start_year"],
+            end_year=metrics["end_year"],
+            history_years=metrics["history_years"],
+            total_growth_abs=metrics["total_growth_abs"],
+            total_growth_pct=metrics["total_growth_pct"],
+            average_yoy_growth_pct=metrics["average_yoy_growth_pct"],
+            cagr_pct=metrics["cagr_pct"],
+            price_to_current_woz_ratio=price_to_current_woz_ratio,
+            yearly_growth=metrics["yearly_growth"],
+            woz_history=history,
+        )
 
 
 def _service(ctx: Context) -> FundaService:
@@ -588,6 +1325,7 @@ def build_server() -> FastMCP[FundaService]:
         name="search_listings",
         description=(
             "Search Funda listings by location and filters. "
+            "The MCP auto-resolves common city aliases, postcodes, and some neighbourhood names before querying Funda. "
             "Defaults: offering_type='buy', availability=['available','negotiations'], object_type=['house','apartment']. "
             "Example: location='leiden', price_max=500000."
         ),
@@ -597,7 +1335,7 @@ def build_server() -> FastMCP[FundaService]:
         ctx: Context,
         location: Annotated[
             str | list[str] | None,
-            Field(description="A city, area, postcode, or list of locations. Values are normalized to lowercase."),
+            Field(description="A city, area, postcode, or list of locations. The MCP may auto-resolve aliases or neighbourhood fallbacks before querying Funda."),
         ] = None,
         offering_type: Annotated[OfferingTypeValue, Field(description="Whether to search buy or rent listings.")] = "buy",
         availability: Annotated[AvailabilityValue | list[AvailabilityValue] | None, Field(description="Listing status filter. Supports one value or a list.")] = None,
@@ -681,6 +1419,93 @@ def build_server() -> FastMCP[FundaService]:
         timeout_seconds: Annotated[int, Field(description="HTTP timeout in seconds.", ge=1, le=MAX_TIMEOUT)] = DEFAULT_TIMEOUT,
     ) -> PriceHistoryResponse:
         return _service(ctx).get_price_history(listing_id_or_url, timeout_seconds=timeout_seconds)
+
+    @mcp.tool(
+        name="get_woz_history",
+        description="Fetch historical WOZ values for one exact Dutch address via Kadaster. Example: street='Reehorst', house_number=13, postcode='8105BG', city='Luttenberg'.",
+        structured_output=True,
+    )
+    def get_woz_history(
+        ctx: Context,
+        street: Annotated[str, Field(description="Street name of the property.")],
+        house_number: Annotated[int, Field(description="House number.", ge=1)],
+        postcode: Annotated[str, Field(description="Dutch postcode, with or without a space.")],
+        city: Annotated[str, Field(description="City or village name.")],
+        house_letter: Annotated[str | None, Field(description="Optional house letter, for example 'A'.")] = None,
+        house_number_suffix: Annotated[str | None, Field(description="Optional house number suffix, for example '2' or 'bis'.")] = None,
+        timeout_seconds: Annotated[int, Field(description="HTTP timeout in seconds.", ge=1, le=MAX_TIMEOUT)] = DEFAULT_TIMEOUT,
+    ) -> WozHistoryResponse:
+        return _service(ctx).get_woz_history(
+            street=street,
+            house_number=house_number,
+            postcode=postcode,
+            city=city,
+            house_letter=house_letter,
+            house_number_suffix=house_number_suffix,
+            timeout_seconds=timeout_seconds,
+        )
+
+    @mcp.tool(
+        name="calculate_growth_roi",
+        description="Calculate property value growth metrics from WOZ history for either a Funda listing or a direct address.",
+        structured_output=True,
+    )
+    def calculate_growth_roi(
+        ctx: Context,
+        listing_id_or_url: Annotated[str | None, Field(description="Optional 7 to 9 digit Funda listing ID or full detail URL.")] = None,
+        acquisition_price: Annotated[float | None, Field(description="Optional purchase price in euros, used only for comparison fields such as price_to_current_woz_ratio.", gt=0)] = None,
+        years: Annotated[int | None, Field(description="Optional number of most recent annual WOZ records to include; minimum 2.", ge=2)] = None,
+        street: Annotated[str | None, Field(description="Street name for direct address lookups.")] = None,
+        house_number: Annotated[int | None, Field(description="House number for direct address lookups.", ge=1)] = None,
+        postcode: Annotated[str | None, Field(description="Dutch postcode for direct address lookups.")] = None,
+        city: Annotated[str | None, Field(description="City or village name for direct address lookups.")] = None,
+        house_letter: Annotated[str | None, Field(description="Optional house letter for direct address lookups.")] = None,
+        house_number_suffix: Annotated[str | None, Field(description="Optional house number suffix for direct address lookups.")] = None,
+        timeout_seconds: Annotated[int, Field(description="HTTP timeout in seconds.", ge=1, le=MAX_TIMEOUT)] = DEFAULT_TIMEOUT,
+    ) -> GrowthRoiResponse:
+        return _service(ctx).calculate_growth_roi(
+            listing_id_or_url=listing_id_or_url,
+            acquisition_price=acquisition_price,
+            years=years,
+            street=street,
+            house_number=house_number,
+            postcode=postcode,
+            city=city,
+            house_letter=house_letter,
+            house_number_suffix=house_number_suffix,
+            timeout_seconds=timeout_seconds,
+        )
+
+    @mcp.tool(
+        name="calculate_gross_yield",
+        description="Calculate gross rental yield from either a Funda listing or a direct address, enriched with historical WOZ values. This is a rental yield tool, not a property appreciation ROI tool.",
+        structured_output=True,
+    )
+    def calculate_gross_yield(
+        ctx: Context,
+        monthly_rent: Annotated[float, Field(description="Expected monthly rent in euros.", ge=0)],
+        listing_id_or_url: Annotated[str | None, Field(description="Optional 7 to 9 digit Funda listing ID or full detail URL.")] = None,
+        acquisition_price: Annotated[float | None, Field(description="Purchase price in euros; defaults to the listing price when listing_id_or_url is provided and is required for direct-address calculations.", gt=0)] = None,
+        street: Annotated[str | None, Field(description="Street name for direct address lookups.")] = None,
+        house_number: Annotated[int | None, Field(description="House number for direct address lookups.", ge=1)] = None,
+        postcode: Annotated[str | None, Field(description="Dutch postcode for direct address lookups.")] = None,
+        city: Annotated[str | None, Field(description="City or village name for direct address lookups.")] = None,
+        house_letter: Annotated[str | None, Field(description="Optional house letter for direct address lookups.")] = None,
+        house_number_suffix: Annotated[str | None, Field(description="Optional house number suffix for direct address lookups.")] = None,
+        timeout_seconds: Annotated[int, Field(description="HTTP timeout in seconds.", ge=1, le=MAX_TIMEOUT)] = DEFAULT_TIMEOUT,
+    ) -> GrossYieldResponse:
+        return _service(ctx).calculate_gross_yield(
+            monthly_rent=monthly_rent,
+            listing_id_or_url=listing_id_or_url,
+            acquisition_price=acquisition_price,
+            street=street,
+            house_number=house_number,
+            postcode=postcode,
+            city=city,
+            house_letter=house_letter,
+            house_number_suffix=house_number_suffix,
+            timeout_seconds=timeout_seconds,
+        )
 
     return mcp
 
